@@ -17,8 +17,11 @@
 package miner
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -167,6 +170,44 @@ func (a *RemoteAgent) SubmitWork(nonce types.BlockNonce, hash common.Hash) bool 
 // RemoteAgent.Start() constantly recreates these channels, so the loop code cannot
 // assume data stability in these member fields.
 func (a *RemoteAgent) loop(workCh chan *Work, quitCh chan struct{}) {
+
+	// notify work
+	var (
+		notifyTransport = &http.Transport{}
+		notifyClient    = &http.Client{
+			Transport: notifyTransport,
+			Timeout:   time.Second,
+		}
+		notifyReqs = make([]*http.Request, 1)
+		notify     = [1]string{"127.0.0.1:11000"}
+	)
+	// notifyWork notifies all the specified mining endpoints of the availability of
+	// new work to be processed.
+	notifyWork := func() {
+		work, _ := a.GetWork()
+		blob, _ := json.Marshal(work)
+
+		for i, url := range notify {
+			// Terminate any previously pending request and create the new work
+			if notifyReqs[i] != nil {
+				notifyTransport.CancelRequest(notifyReqs[i])
+			}
+			notifyReqs[i], _ = http.NewRequest("POST", url, bytes.NewReader(blob))
+			notifyReqs[i].Header.Set("Content-Type", "application/json")
+
+			// Push the new work concurrently to all the remote nodes
+			go func(req *http.Request, url string) {
+				res, err := notifyClient.Do(req)
+				if err != nil {
+					log.Warn("Failed to notify remote miner", "err", err)
+				} else {
+					log.Trace("Notified remote miner", "miner", url, "hash", log.Lazy{Fn: func() common.Hash { return common.HexToHash(work[0]) }}, "target", work[1])
+					res.Body.Close()
+				}
+			}(notifyReqs[i], url)
+		}
+	}
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -178,6 +219,9 @@ func (a *RemoteAgent) loop(workCh chan *Work, quitCh chan struct{}) {
 			a.mu.Lock()
 			a.currentWork = work
 			a.mu.Unlock()
+			// Notify and requested URLs of the new work availability
+			notifyWork()
+
 		case <-ticker.C:
 			// cleanup
 			a.mu.Lock()
